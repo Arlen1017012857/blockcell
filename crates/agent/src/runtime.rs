@@ -1022,6 +1022,7 @@ impl AgentRuntime {
 
         // Main loop with max iterations
         let max_iterations = self.config.agents.defaults.max_tool_iterations;
+        let use_stream = self.config.agents.defaults.stream;
         let mut current_messages = messages;
         let mut final_response = String::new();
         let mut message_tool_sent_media = false;
@@ -1043,7 +1044,52 @@ impl AgentRuntime {
                     warn!(attempt, max_retries, delay_ms, iteration, "Retrying LLM call after transient error");
                     tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
                 }
-                match self.provider.chat(&current_messages, &tools).await {
+
+                let call_result = if use_stream {
+                    let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+                    let event_tx_clone = self.event_tx.clone();
+                    let chat_id_clone = msg.chat_id.clone();
+
+                    // Spawn a task to forward streaming deltas to WebSocket clients
+                    // using the frontend's existing protocol: token / thinking / message_done
+                    let forward_handle = tokio::spawn(async move {
+                        while let Some(event) = stream_rx.recv().await {
+                            if let Some(ref etx) = event_tx_clone {
+                                match &event {
+                                    blockcell_core::types::StreamEvent::ContentDelta(delta) => {
+                                        let ev = serde_json::json!({
+                                            "type": "token",
+                                            "chat_id": chat_id_clone,
+                                            "delta": delta,
+                                        });
+                                        let _ = etx.send(ev.to_string());
+                                    }
+                                    blockcell_core::types::StreamEvent::ReasoningDelta(delta) => {
+                                        let ev = serde_json::json!({
+                                            "type": "thinking",
+                                            "chat_id": chat_id_clone,
+                                            "content": delta,
+                                        });
+                                        let _ = etx.send(ev.to_string());
+                                    }
+                                    blockcell_core::types::StreamEvent::Done(_) => {
+                                        // message_done is emitted later by process_message
+                                        // after history is saved, so we skip it here.
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                    });
+
+                    let result = self.provider.chat_stream(&current_messages, &tools, stream_tx).await;
+                    let _ = forward_handle.await;
+                    result
+                } else {
+                    self.provider.chat(&current_messages, &tools).await
+                };
+
+                match call_result {
                     Ok(r) => {
                         if attempt > 0 {
                             info!(attempt, iteration, "LLM call succeeded after retry");
@@ -1141,12 +1187,12 @@ impl AgentRuntime {
 
                     // Detect thin web_search results (only titles/URLs, no actual content).
                     // When this happens, extract the top URLs so the next hint can suggest web_fetch.
-                    if tool_call.name == "web_search" && !result.starts_with("Tool error:") {
-                        if is_thin_search_result(&result) {
-                            let urls = extract_urls_from_search_result(&result);
-                            if !urls.is_empty() {
-                                web_search_thin_results.extend(urls);
-                            }
+                    if tool_call.name == "web_search" && !result.starts_with("Tool error:")
+                        && is_thin_search_result(&result)
+                    {
+                        let urls = extract_urls_from_search_result(&result);
+                        if !urls.is_empty() {
+                            web_search_thin_results.extend(urls);
                         }
                     }
 
@@ -1177,7 +1223,7 @@ impl AgentRuntime {
                                     && t.get("function")
                                         .and_then(|f| f.get("parameters"))
                                         .and_then(|p| p.get("properties"))
-                                        .map(|props| props.as_object().map_or(false, |o| !o.is_empty()))
+                                        .map(|props| props.as_object().is_some_and(|o| !o.is_empty()))
                                         .unwrap_or(false)
                             });
                             if !already_full {
@@ -1287,7 +1333,36 @@ impl AgentRuntime {
                         "请基于以上工具调用的结果，直接给出最终答案。不要再调用任何工具，也不要输出类似[Called: ...]的过程信息。",
                     ));
 
-                    match self.provider.chat(&final_messages, &[]).await {
+                    let final_result = if use_stream {
+                        let (stream_tx, mut stream_rx) = tokio::sync::mpsc::unbounded_channel();
+                        let event_tx_clone = self.event_tx.clone();
+                        let chat_id_clone = msg.chat_id.clone();
+                        let forward_handle = tokio::spawn(async move {
+                            while let Some(event) = stream_rx.recv().await {
+                                if let Some(ref etx) = event_tx_clone {
+                                    match &event {
+                                        blockcell_core::types::StreamEvent::ContentDelta(delta) => {
+                                            let ev = serde_json::json!({
+                                                "type": "token",
+                                                "chat_id": chat_id_clone,
+                                                "delta": delta,
+                                            });
+                                            let _ = etx.send(ev.to_string());
+                                        }
+                                        blockcell_core::types::StreamEvent::Done(_) => {}
+                                        _ => {}
+                                    }
+                                }
+                            }
+                        });
+                        let result = self.provider.chat_stream(&final_messages, &[], stream_tx).await;
+                        let _ = forward_handle.await;
+                        result
+                    } else {
+                        self.provider.chat(&final_messages, &[]).await
+                    };
+
+                    match final_result {
                         Ok(r) => {
                             final_response = r.content.unwrap_or_default();
                             history.push(ChatMessage::assistant(&final_response));
@@ -2113,6 +2188,7 @@ impl AgentRuntime {
 
 /// Free async function that runs a user message in the background.
 /// Each message gets its own AgentRuntime so the main loop stays responsive.
+#[allow(clippy::too_many_arguments)]
 async fn run_message_task(
     config: Config,
     paths: Paths,
@@ -2193,6 +2269,7 @@ async fn run_message_task(
 /// Free async function that runs a subagent task in the background.
 /// This is separate from `AgentRuntime` methods to break the recursive async type
 /// chain that would otherwise prevent the future from being `Send`.
+#[allow(clippy::too_many_arguments)]
 async fn run_subagent_task(
     config: Config,
     paths: Paths,

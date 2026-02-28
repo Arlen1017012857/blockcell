@@ -294,7 +294,7 @@ fn keccak_f1600(state: &mut [u64; 25]) {
         14, 24, 9, 19, 4,
     ];
 
-    for round in 0..24 {
+    for rc_val in &RC {
         // θ step
         let mut c = [0u64; 5];
         for x in 0..5 {
@@ -322,7 +322,7 @@ fn keccak_f1600(state: &mut [u64; 25]) {
         }
 
         // ι step
-        state[0] ^= RC[round];
+        state[0] ^= rc_val;
     }
 }
 
@@ -508,9 +508,9 @@ fn abi_decode_data(data: &[u8], types: &[String]) -> Result<Vec<Value>> {
             let val = word[31] != 0;
             results.push(json!({"type": "bool", "value": val}));
             offset += 32;
-        } else if typ.starts_with("uint") {
+        } else if let Some(stripped) = typ.strip_prefix("uint") {
             // Read as big-endian u128 (covers up to uint128; for uint256 we use hex)
-            let bits: usize = typ[4..].parse().unwrap_or(256);
+            let bits: usize = stripped.parse().unwrap_or(256);
             if bits <= 128 {
                 let mut buf = [0u8; 16];
                 buf.copy_from_slice(&word[16..32]);

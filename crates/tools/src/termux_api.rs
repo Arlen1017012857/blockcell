@@ -113,14 +113,12 @@ impl Tool for TermuxApiTool {
         let action = params.get("action").and_then(|v| v.as_str()).unwrap_or("info");
 
         // First check if we're running on Termux
-        if action != "info" {
-            if !is_termux_available().await {
-                return Err(Error::Tool(
-                    "Termux API is not available. Make sure you are running on Android with \
-                     'termux-api' package installed (pkg install termux-api) and the Termux:API \
-                     companion app is installed.".into()
-                ));
-            }
+        if action != "info" && !is_termux_available().await {
+            return Err(Error::Tool(
+                "Termux API is not available. Make sure you are running on Android with \
+                 'termux-api' package installed (pkg install termux-api) and the Termux:API \
+                 companion app is installed.".into()
+            ));
         }
 
         match action {
@@ -706,11 +704,11 @@ async fn action_microphone_record(ctx: &ToolContext, params: &Value) -> Result<V
     match mic_action {
         "info" => {
             let output = run_termux_command("termux-microphone-record", &["-i"]).await?;
-            return parse_termux_output("termux-microphone-record", &output);
+            parse_termux_output("termux-microphone-record", &output)
         }
         "stop" => {
             let output = run_termux_command("termux-microphone-record", &["-q"]).await?;
-            return parse_termux_output("termux-microphone-record", &output);
+            parse_termux_output("termux-microphone-record", &output)
         }
         "start" => {
             let output_path = params.get("output_path")

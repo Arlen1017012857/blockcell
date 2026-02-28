@@ -499,9 +499,10 @@ enum CronCommands {
     },
 }
 
-#[derive(Subcommand)]
+#[derive(Default, Subcommand)]
 enum UpgradeCommands {
     /// Check for available updates
+    #[default]
     Check,
     /// Download available update
     Download,
@@ -515,12 +516,6 @@ enum UpgradeCommands {
     },
     /// Show upgrade status
     Status,
-}
-
-impl Default for UpgradeCommands {
-    fn default() -> Self {
-        UpgradeCommands::Check
-    }
 }
 
 #[derive(Subcommand)]
@@ -769,8 +764,8 @@ async fn main() -> anyhow::Result<()> {
             ToolsCommands::Test { tool_name, params } => {
                 commands::tools_cmd::test(&tool_name, &params).await?;
             }
-            ToolsCommands::Toggle { tool_name, enable, disable } => {
-                let enabled = if disable { false } else { enable || true };
+            ToolsCommands::Toggle { tool_name, enable: _, disable } => {
+                let enabled = !disable;
                 commands::tools_cmd::toggle(&tool_name, enabled).await?;
             }
         },

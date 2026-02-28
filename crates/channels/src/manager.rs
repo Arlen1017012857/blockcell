@@ -56,6 +56,10 @@ impl ChannelManager {
             "telegram" => {
                 #[cfg(feature = "telegram")]
                 {
+                    if self.config.channels.telegram.token.is_empty() {
+                        tracing::warn!("Telegram: skipping outbound message — no token configured");
+                        return Ok(());
+                    }
                     if !msg.media.is_empty() {
                         for file_path in &msg.media {
                             if let Err(e) = crate::telegram::send_media_message(

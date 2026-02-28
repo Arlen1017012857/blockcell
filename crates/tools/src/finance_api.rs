@@ -181,7 +181,7 @@ impl FinanceApiTool {
     }
 
     fn contains_non_ascii(s: &str) -> bool {
-        s.chars().any(|c| !c.is_ascii())
+        !s.is_ascii()
     }
 
     fn market_from_secid(secid: &str) -> &'static str {

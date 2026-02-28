@@ -533,6 +533,7 @@ impl ContextBuilder {
     /// Build messages with intent-based filtering and channel context.
     /// `pending_intent`: when true the channel already sent an ack; skip image base64 embedding
     /// so the LLM only sees the path text and asks the user what to do instead of auto-analyzing.
+    #[allow(clippy::too_many_arguments)]
     pub fn build_messages_for_intents_with_channel(
         &self,
         history: &[ChatMessage],
@@ -723,7 +724,7 @@ impl ContextBuilder {
                 recent_msgs.push(Self::trim_chat_message(msg));
             }
         }
-        let recent_tokens: usize = recent_msgs.iter().map(|m| estimate_message_tokens(m)).sum();
+        let recent_tokens: usize = recent_msgs.iter().map(estimate_message_tokens).sum();
 
         // If recent rounds alone exceed budget, just return them (trimmed harder)
         if recent_tokens >= token_budget {
@@ -848,9 +849,9 @@ impl ContextBuilder {
 
                         // Check that all expected tool responses follow
                         let mut found_ids = std::collections::HashSet::new();
-                        for j in (i + 1)..history.len() {
-                            if history[j].role == "tool" {
-                                if let Some(ref id) = history[j].tool_call_id {
+                        for item in &history[(i + 1)..] {
+                            if item.role == "tool" {
+                                if let Some(ref id) = item.tool_call_id {
                                     found_ids.insert(id.as_str());
                                 }
                             } else {

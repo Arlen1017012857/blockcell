@@ -2972,6 +2972,7 @@ fn rand_u32() -> u32 {
     h.finish() as u32
 }
 
+#[allow(clippy::too_many_arguments)]
 fn print_startup_banner(
     config: &Config,
     host: &str,
@@ -3105,7 +3106,7 @@ fn print_startup_banner(
         detail: String,
     }
 
-    let channels = vec![
+    let channels = [
         ChannelInfo {
             name: "Telegram",
             enabled: ch.telegram.enabled,

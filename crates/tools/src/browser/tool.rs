@@ -185,7 +185,7 @@ impl Tool for BrowseTool {
         let session_name = params["session"].as_str().unwrap_or("default");
         let headed = params["headed"].as_bool().unwrap_or(false);
         let engine = params["browser"].as_str()
-            .map(BrowserEngine::from_str)
+            .map(BrowserEngine::parse)
             .unwrap_or(BrowserEngine::Chrome);
 
         let workspace = ctx.workspace.clone();
@@ -1349,13 +1349,13 @@ mod tests {
 
     #[test]
     fn test_browser_engine_from_str() {
-        assert_eq!(BrowserEngine::from_str("chrome"), BrowserEngine::Chrome);
-        assert_eq!(BrowserEngine::from_str("Chrome"), BrowserEngine::Chrome);
-        assert_eq!(BrowserEngine::from_str("firefox"), BrowserEngine::Firefox);
-        assert_eq!(BrowserEngine::from_str("ff"), BrowserEngine::Firefox);
-        assert_eq!(BrowserEngine::from_str("edge"), BrowserEngine::Edge);
-        assert_eq!(BrowserEngine::from_str("msedge"), BrowserEngine::Edge);
-        assert_eq!(BrowserEngine::from_str("unknown"), BrowserEngine::Chrome); // default
+        assert_eq!(BrowserEngine::parse("chrome"), BrowserEngine::Chrome);
+        assert_eq!(BrowserEngine::parse("Chrome"), BrowserEngine::Chrome);
+        assert_eq!(BrowserEngine::parse("firefox"), BrowserEngine::Firefox);
+        assert_eq!(BrowserEngine::parse("ff"), BrowserEngine::Firefox);
+        assert_eq!(BrowserEngine::parse("edge"), BrowserEngine::Edge);
+        assert_eq!(BrowserEngine::parse("msedge"), BrowserEngine::Edge);
+        assert_eq!(BrowserEngine::parse("unknown"), BrowserEngine::Chrome); // default
     }
 
     #[test]

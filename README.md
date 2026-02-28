@@ -156,6 +156,28 @@ cd blockcell
 cargo build --release
 ```
 
+#### 安装到系统 PATH
+
+```bash
+cargo install --path bin/blockcell
+```
+
+这会将 `blockcell` 安装到 `~/.cargo/bin/`，之后可以在任意位置直接使用 `blockcell` 命令。
+更新源码后需要重新运行此命令以安装新版本。
+
+#### 开发阶段推荐
+
+开发过程中无需每次都 install，可以直接：
+
+```bash
+# 编译后直接运行
+cargo build
+./target/debug/blockcell onboard
+
+# 或一步完成编译+运行
+cargo run --bin blockcell -- onboard
+```
+
 ### 首次运行
 
 ```bash

@@ -29,7 +29,7 @@ impl MemoryScope {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "short_term" => Some(MemoryScope::ShortTerm),
             "long_term" => Some(MemoryScope::LongTerm),
@@ -70,7 +70,7 @@ impl MemoryType {
         }
     }
 
-    pub fn from_str(s: &str) -> Option<Self> {
+    pub fn parse(s: &str) -> Option<Self> {
         match s {
             "fact" => Some(MemoryType::Fact),
             "preference" => Some(MemoryType::Preference),

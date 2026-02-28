@@ -1,10 +1,11 @@
 use async_trait::async_trait;
-use blockcell_core::types::{ChatMessage, LLMResponse, ToolCallRequest};
+use blockcell_core::types::{ChatMessage, LLMResponse, StreamEvent, ToolCallRequest};
 use blockcell_core::{Error, Result};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::sync::atomic::{AtomicBool, Ordering};
+use tokio::sync::mpsc;
 use tracing::{debug, error, info, warn};
 
 use crate::Provider;
@@ -92,7 +93,7 @@ impl OpenAIProvider {
     /// Handles multiple formats:
     /// - `<tool_call>{"name":"...","arguments":{...}}</tool_call>`
     /// - `[TOOL_CALL]{tool => "...", args => {...}}[/TOOL_CALL]`
-    /// Returns (remaining_text, parsed_tool_calls).
+    ///   Returns (remaining_text, parsed_tool_calls).
     fn parse_text_tool_calls(content: &str) -> (String, Vec<ToolCallRequest>) {
         let mut tool_calls = Vec::new();
         let mut remaining = String::new();
@@ -408,9 +409,9 @@ impl OpenAIProvider {
             if let Some(pos) = text.find(pat.as_str()) {
                 let after = text[pos + pat.len()..].trim();
                 // Quoted value
-                if after.starts_with('"') {
-                    if let Some(end_quote) = after[1..].find('"') {
-                        return Some(after[1..1 + end_quote].to_string());
+                if let Some(stripped) = after.strip_prefix('"') {
+                    if let Some(end_quote) = stripped.find('"') {
+                        return Some(stripped[..end_quote].to_string());
                     }
                 }
                 // Unquoted value — take until comma or whitespace
@@ -756,6 +757,229 @@ impl Provider for OpenAIProvider {
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
             usage: chat_response.usage.unwrap_or(Value::Null),
         })
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        tx: mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<LLMResponse> {
+        let use_text_mode = self.text_tool_mode.load(Ordering::Relaxed);
+
+        // For text-tool-mode or when tools are present and we need text parsing,
+        // fall back to non-streaming to keep tool parsing logic intact.
+        if use_text_mode || tools.is_empty() {
+            // Simple streaming for no-tools / text-tool-mode
+        }
+
+        let use_native_tools = !use_text_mode && !tools.is_empty();
+        let url = format!("{}/chat/completions", self.api_base);
+
+        let (api_messages, api_tools) = if use_native_tools {
+            (messages.to_vec(), tools.to_vec())
+        } else if !tools.is_empty() {
+            (Self::inject_tools_into_messages(messages, tools), vec![])
+        } else {
+            (messages.to_vec(), vec![])
+        };
+
+        let mut request = serde_json::json!({
+            "model": &self.model,
+            "messages": api_messages,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "stream": true,
+        });
+
+        if !api_tools.is_empty() {
+            request["tools"] = Value::Array(api_tools);
+            request["tool_choice"] = Value::String("auto".to_string());
+        }
+
+        info!(url = %url, model = %self.model, stream = true, "Calling LLM (streaming)");
+
+        let response = self
+            .client
+            .post(&url)
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| Error::Provider(format!("Stream request failed: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            error!(status = %status, body = %body, "LLM streaming API error");
+            return Err(Error::Provider(format!("API error {}: {}", status, body)));
+        }
+
+        // Parse SSE stream
+        let mut content_buf = String::new();
+        let mut reasoning_buf = String::new();
+        let mut finish_reason = String::new();
+        let mut usage_val = Value::Null;
+
+        // Tool call accumulators: index -> (id, name, arguments_buf)
+        let mut tc_map: std::collections::BTreeMap<usize, (String, String, String)> =
+            std::collections::BTreeMap::new();
+
+        let mut byte_stream = response.bytes_stream();
+        use futures::StreamExt;
+        let mut line_buf = String::new();
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(format!("Stream read error: {}", e)));
+                    break;
+                }
+            };
+
+            let text = String::from_utf8_lossy(&chunk);
+            line_buf.push_str(&text);
+
+            // Process complete SSE lines
+            while let Some(pos) = line_buf.find('\n') {
+                let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                line_buf = line_buf[pos + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                let data = if let Some(d) = line.strip_prefix("data: ") {
+                    d.trim()
+                } else {
+                    continue;
+                };
+
+                if data == "[DONE]" {
+                    break;
+                }
+
+                let chunk_json: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                // Extract usage if present (some providers send it in the final chunk)
+                if let Some(u) = chunk_json.get("usage") {
+                    if !u.is_null() {
+                        usage_val = u.clone();
+                    }
+                }
+
+                let Some(choices) = chunk_json.get("choices").and_then(|c| c.as_array()) else {
+                    continue;
+                };
+
+                for choice in choices {
+                    // finish_reason
+                    if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
+                        finish_reason = fr.to_string();
+                    }
+
+                    let Some(delta) = choice.get("delta") else {
+                        continue;
+                    };
+
+                    // Content delta
+                    if let Some(c) = delta.get("content").and_then(|v| v.as_str()) {
+                        if !c.is_empty() {
+                            content_buf.push_str(c);
+                            let _ = tx.send(StreamEvent::ContentDelta(c.to_string()));
+                        }
+                    }
+
+                    // Reasoning content delta
+                    if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                        if !r.is_empty() {
+                            reasoning_buf.push_str(r);
+                            let _ = tx.send(StreamEvent::ReasoningDelta(r.to_string()));
+                        }
+                    }
+
+                    // Tool call deltas
+                    if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
+                        for tc in tcs {
+                            let idx = tc.get("index").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
+                            let entry = tc_map.entry(idx).or_insert_with(|| {
+                                (String::new(), String::new(), String::new())
+                            });
+
+                            let id_delta = tc.get("id").and_then(|v| v.as_str());
+                            let name_delta = tc.pointer("/function/name").and_then(|v| v.as_str());
+                            let args_delta = tc.pointer("/function/arguments").and_then(|v| v.as_str());
+
+                            if let Some(id) = id_delta {
+                                entry.0.push_str(id);
+                            }
+                            if let Some(name) = name_delta {
+                                entry.1.push_str(name);
+                            }
+                            if let Some(args) = args_delta {
+                                entry.2.push_str(args);
+                            }
+
+                            let _ = tx.send(StreamEvent::ToolCallDelta {
+                                index: idx,
+                                id: id_delta.map(|s| s.to_string()),
+                                name: name_delta.map(|s| s.to_string()),
+                                arguments_delta: args_delta.unwrap_or("").to_string(),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+
+        // Assemble final LLMResponse
+        let tool_calls: Vec<ToolCallRequest> = tc_map
+            .into_values()
+            .map(|(id, name, args_str)| {
+                let arguments: Value = serde_json::from_str(&args_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                ToolCallRequest { id, name, arguments }
+            })
+            .collect();
+
+        // For text-tool-mode: parse tool calls from accumulated content
+        let (final_content, final_tool_calls) = if !use_native_tools && !tools.is_empty() && tool_calls.is_empty() {
+            let (remaining, parsed) = Self::parse_text_tool_calls(&content_buf);
+            (remaining, parsed)
+        } else {
+            (content_buf.clone(), tool_calls)
+        };
+
+        if finish_reason.is_empty() {
+            finish_reason = if !final_tool_calls.is_empty() {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            };
+        }
+
+        let response = LLMResponse {
+            content: if final_content.is_empty() { None } else { Some(final_content) },
+            reasoning_content: if reasoning_buf.is_empty() { None } else { Some(reasoning_buf) },
+            tool_calls: final_tool_calls,
+            finish_reason,
+            usage: usage_val,
+        };
+
+        let _ = tx.send(StreamEvent::Done(response.clone()));
+
+        info!(
+            content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
+            tool_calls_count = response.tool_calls.len(),
+            "Streaming response complete"
+        );
+
+        Ok(response)
     }
 }
 

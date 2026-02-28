@@ -1,9 +1,10 @@
 use async_trait::async_trait;
-use blockcell_core::types::{ChatMessage, LLMResponse, ToolCallRequest};
+use blockcell_core::types::{ChatMessage, LLMResponse, StreamEvent, ToolCallRequest};
 use blockcell_core::{Error, Result};
 use reqwest::Client;
 use serde::Deserialize;
 use serde_json::Value;
+use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::Provider;
@@ -406,6 +407,207 @@ impl Provider for AnthropicProvider {
             finish_reason,
             usage,
         })
+    }
+
+    async fn chat_stream(
+        &self,
+        messages: &[ChatMessage],
+        tools: &[Value],
+        tx: mpsc::UnboundedSender<StreamEvent>,
+    ) -> Result<LLMResponse> {
+        let url = format!("{}/messages", self.api_base);
+        let model = Self::normalize_model(&self.model);
+
+        let (system, anthropic_messages) = Self::convert_messages(messages);
+        let anthropic_tools = Self::convert_tools(tools);
+
+        let mut request = serde_json::json!({
+            "model": model,
+            "max_tokens": self.max_tokens,
+            "temperature": self.temperature,
+            "messages": anthropic_messages,
+            "stream": true,
+        });
+
+        if let Some(sys) = &system {
+            request["system"] = Value::String(sys.clone());
+        }
+        if !anthropic_tools.is_empty() {
+            request["tools"] = Value::Array(anthropic_tools);
+        }
+
+        info!(url = %url, model = %model, stream = true, "Calling Anthropic API (streaming)");
+
+        let response = self
+            .client
+            .post(&url)
+            .header("x-api-key", &self.api_key)
+            .header("anthropic-version", ANTHROPIC_VERSION)
+            .header("Content-Type", "application/json")
+            .json(&request)
+            .send()
+            .await
+            .map_err(|e| Error::Provider(format!("Anthropic stream request failed: {}", e)))?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            error!(status = %status, body = %body, "Anthropic streaming API error");
+            return Err(Error::Provider(format!("Anthropic API error {}: {}", status, body)));
+        }
+
+        let mut content_buf = String::new();
+        let mut finish_reason = String::new();
+        let mut usage_val = Value::Null;
+
+        // Tool use accumulators: index -> (id, name, input_json_buf)
+        let mut tc_list: Vec<(String, String, String)> = Vec::new();
+        let mut current_tc_index: Option<usize> = None;
+
+        let mut byte_stream = response.bytes_stream();
+        use futures::StreamExt;
+        let mut line_buf = String::new();
+
+        while let Some(chunk_result) = byte_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(StreamEvent::Error(format!("Stream read error: {}", e)));
+                    break;
+                }
+            };
+
+            let text = String::from_utf8_lossy(&chunk);
+            line_buf.push_str(&text);
+
+            while let Some(pos) = line_buf.find('\n') {
+                let line = line_buf[..pos].trim_end_matches('\r').to_string();
+                line_buf = line_buf[pos + 1..].to_string();
+
+                if line.is_empty() || line.starts_with(':') {
+                    continue;
+                }
+
+                let data = if let Some(d) = line.strip_prefix("data: ") {
+                    d.trim()
+                } else {
+                    // Anthropic also sends "event: ..." lines; skip them.
+                    continue;
+                };
+
+                let ev: Value = match serde_json::from_str(data) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+
+                let ev_type = ev.get("type").and_then(|v| v.as_str()).unwrap_or("");
+
+                match ev_type {
+                    "content_block_start" => {
+                        // A new content block is starting.
+                        if let Some(block) = ev.get("content_block") {
+                            let block_type = block.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            if block_type == "tool_use" {
+                                let id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                let name = block.get("name").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                                tc_list.push((id, name, String::new()));
+                                current_tc_index = Some(tc_list.len() - 1);
+                            } else {
+                                current_tc_index = None;
+                            }
+                        }
+                    }
+                    "content_block_delta" => {
+                        if let Some(delta) = ev.get("delta") {
+                            let delta_type = delta.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                            match delta_type {
+                                "text_delta" => {
+                                    if let Some(t) = delta.get("text").and_then(|v| v.as_str()) {
+                                        if !t.is_empty() {
+                                            content_buf.push_str(t);
+                                            let _ = tx.send(StreamEvent::ContentDelta(t.to_string()));
+                                        }
+                                    }
+                                }
+                                "input_json_delta" => {
+                                    if let Some(idx) = current_tc_index {
+                                        if let Some(partial) = delta.get("partial_json").and_then(|v| v.as_str()) {
+                                            tc_list[idx].2.push_str(partial);
+                                            let _ = tx.send(StreamEvent::ToolCallDelta {
+                                                index: idx,
+                                                id: None,
+                                                name: None,
+                                                arguments_delta: partial.to_string(),
+                                            });
+                                        }
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                    "content_block_stop" => {
+                        current_tc_index = None;
+                    }
+                    "message_delta" => {
+                        if let Some(d) = ev.get("delta") {
+                            if let Some(sr) = d.get("stop_reason").and_then(|v| v.as_str()) {
+                                finish_reason = match sr {
+                                    "end_turn" => "stop".to_string(),
+                                    "tool_use" => "tool_calls".to_string(),
+                                    "max_tokens" => "length".to_string(),
+                                    other => other.to_string(),
+                                };
+                            }
+                        }
+                        if let Some(u) = ev.get("usage") {
+                            if !u.is_null() {
+                                usage_val = u.clone();
+                            }
+                        }
+                    }
+                    "message_stop" => {
+                        // Stream complete.
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        let tool_calls: Vec<ToolCallRequest> = tc_list
+            .into_iter()
+            .map(|(id, name, args_str)| {
+                let arguments: Value = serde_json::from_str(&args_str)
+                    .unwrap_or(Value::Object(serde_json::Map::new()));
+                ToolCallRequest { id, name, arguments }
+            })
+            .collect();
+
+        if finish_reason.is_empty() {
+            finish_reason = if !tool_calls.is_empty() {
+                "tool_calls".to_string()
+            } else {
+                "stop".to_string()
+            };
+        }
+
+        let response = LLMResponse {
+            content: if content_buf.is_empty() { None } else { Some(content_buf) },
+            reasoning_content: None,
+            tool_calls,
+            finish_reason,
+            usage: usage_val,
+        };
+
+        let _ = tx.send(StreamEvent::Done(response.clone()));
+
+        info!(
+            content_len = response.content.as_ref().map(|c| c.len()).unwrap_or(0),
+            tool_calls_count = response.tool_calls.len(),
+            "Anthropic streaming response complete"
+        );
+
+        Ok(response)
     }
 }
 

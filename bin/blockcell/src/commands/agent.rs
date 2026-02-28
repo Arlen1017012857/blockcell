@@ -117,7 +117,7 @@ const BUILTIN_TOOLS: &[(&str, &[(&str, &str)])] = &[
 /// - Inline absolute paths: `/path/to/image.png what is this image`
 /// - @-prefixed paths: `@/path/to/image.png recognize this`
 /// - ~ home dir paths: `~/Desktop/photo.jpg take a look`
-/// Returns (cleaned_text, media_paths).
+///   Returns (cleaned_text, media_paths).
 fn extract_media_from_input(input: &str) -> (String, Vec<String>) {
     let image_extensions = ["jpg", "jpeg", "png", "gif", "webp", "bmp", "tiff", "heic"];
     let mut media = Vec::new();
@@ -126,9 +126,9 @@ fn extract_media_from_input(input: &str) -> (String, Vec<String>) {
     for token in input.split_whitespace() {
         let path_str = token.strip_prefix('@').unwrap_or(token);
         // Expand ~ to home dir
-        let expanded: String = if path_str.starts_with("~/") {
+        let expanded: String = if let Some(stripped) = path_str.strip_prefix("~/") {
             if let Some(home) = dirs::home_dir() {
-                home.join(&path_str[2..]).to_string_lossy().into_owned()
+                home.join(stripped).to_string_lossy().into_owned()
             } else {
                 path_str.to_string()
             }

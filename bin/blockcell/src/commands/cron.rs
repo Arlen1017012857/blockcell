@@ -58,6 +58,7 @@ pub async fn list(show_all: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn add(
     name: String,
     message: String,

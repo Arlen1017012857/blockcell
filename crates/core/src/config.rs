@@ -73,6 +73,9 @@ pub struct AgentDefaults {
     /// 如果不指定，将从 evolution_model 推断，或使用主 provider
     #[serde(default)]
     pub evolution_provider: Option<String>,
+    /// 是否启用流式输出（默认 false）
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn default_workspace() -> String {
@@ -121,6 +124,7 @@ impl Default for AgentDefaults {
             provider: None,
             evolution_model: None,
             evolution_provider: None,
+            stream: false,
         }
     }
 }

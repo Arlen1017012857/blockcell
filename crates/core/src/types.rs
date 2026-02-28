@@ -88,6 +88,26 @@ impl Default for LLMResponse {
     }
 }
 
+/// A single chunk from a streaming LLM response.
+#[derive(Debug, Clone)]
+pub enum StreamEvent {
+    /// Incremental text content delta.
+    ContentDelta(String),
+    /// Incremental reasoning/thinking content delta.
+    ReasoningDelta(String),
+    /// A tool call is being assembled; fields may arrive across multiple chunks.
+    ToolCallDelta {
+        index: usize,
+        id: Option<String>,
+        name: Option<String>,
+        arguments_delta: String,
+    },
+    /// Stream finished. Contains the final aggregated response.
+    Done(LLMResponse),
+    /// Stream-level error.
+    Error(String),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct PermissionSet {
     pub permissions: HashSet<String>,
