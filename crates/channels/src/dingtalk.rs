@@ -1,4 +1,4 @@
-use blockcell_core::{Config, Error, InboundMessage, Result};
+use blockcell_core::{Config, Error, InboundMessage, Result, truncate_str};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -565,7 +565,7 @@ impl DingTalkChannel {
             .await
             .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
 
-        let safe_code = &download_code[..download_code.len().min(16)];
+        let safe_code = truncate_str(download_code, 16);
         let filename = format!("dingtalk_{}_{}.{}", media_type, safe_code, ext);
         let file_path = media_dir.join(&filename);
 

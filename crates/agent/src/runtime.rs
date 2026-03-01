@@ -1,4 +1,4 @@
-use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths, Result};
+use blockcell_core::{Config, InboundMessage, OutboundMessage, Paths, Result, truncate_str};
 use blockcell_core::types::{ChatMessage, ToolCallRequest};
 use blockcell_providers::Provider;
 use blockcell_storage::{SessionStore, AuditLogger};
@@ -103,17 +103,6 @@ pub struct ConfirmRequest {
     pub tool_name: String,
     pub paths: Vec<String>,
     pub response_tx: tokio::sync::oneshot::Sender<bool>,
-}
-
-/// Truncate a string at a safe char boundary.
-fn truncate_str(s: &str, max_chars: usize) -> &str {
-    if s.len() <= max_chars {
-        return s;
-    }
-    match s.char_indices().nth(max_chars) {
-        Some((idx, _)) => &s[..idx],
-        None => s,
-    }
 }
 
 /// Summarize a result to 1-2 sentences
@@ -1025,6 +1014,7 @@ impl AgentRuntime {
         let use_stream = self.config.agents.defaults.stream;
         let mut current_messages = messages;
         let mut final_response = String::new();
+        let mut final_reasoning = String::new();
         let mut message_tool_sent_media = false;
         let mut tool_fail_counts: HashMap<String, u32> = HashMap::new();
 
@@ -1162,6 +1152,23 @@ impl AgentRuntime {
                 assistant_msg.tool_calls = Some(response.tool_calls.clone());
                 current_messages.push(assistant_msg.clone());
                 history.push(assistant_msg);
+
+                // Accumulate reasoning from tool-calling iterations.
+                if let Some(ref r) = response.reasoning_content {
+                    info!(
+                        reasoning_len = r.len(),
+                        reasoning_preview = truncate_str(r, 80),
+                        "LLM response (tool-calling iteration) contains reasoning_content"
+                    );
+                    if !r.is_empty() {
+                        if !final_reasoning.is_empty() {
+                            final_reasoning.push('\n');
+                        }
+                        final_reasoning.push_str(r);
+                    }
+                } else {
+                    info!("LLM response (tool-calling iteration) has NO reasoning_content");
+                }
 
                 // Execute each tool call, with dynamic tool supplement for intent misclassification
                 let mut supplemented_tools = false;
@@ -1378,6 +1385,23 @@ impl AgentRuntime {
             } else {
                 // No tool calls, we have the final response
                 final_response = response.content.unwrap_or_default();
+
+                // Capture reasoning from the final response.
+                if let Some(ref r) = response.reasoning_content {
+                    info!(
+                        reasoning_len = r.len(),
+                        reasoning_preview = truncate_str(r, 80),
+                        "LLM final response contains reasoning_content"
+                    );
+                    if !r.is_empty() {
+                        if !final_reasoning.is_empty() {
+                            final_reasoning.push('\n');
+                        }
+                        final_reasoning.push_str(r);
+                    }
+                } else {
+                    info!("LLM final response has NO reasoning_content");
+                }
                 
                 // Add to history
                 history.push(ChatMessage::assistant(&final_response));
@@ -1430,11 +1454,18 @@ impl AgentRuntime {
 
         // Emit message_done event to WebSocket clients
         if let Some(ref event_tx) = self.event_tx {
+            info!(
+                final_reasoning_len = final_reasoning.len(),
+                final_reasoning_empty = final_reasoning.is_empty(),
+                final_reasoning_preview = truncate_str(&final_reasoning, 120),
+                "Emitting message_done event"
+            );
             let event = serde_json::json!({
                 "type": "message_done",
                 "chat_id": msg.chat_id,
                 "task_id": "",
                 "content": final_response,
+                "reasoning_content": if final_reasoning.is_empty() { serde_json::Value::Null } else { serde_json::Value::String(final_reasoning) },
                 "tool_calls": 0,
                 "duration_ms": 0,
             });

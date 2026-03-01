@@ -12,7 +12,7 @@
 
 use aes::cipher::{block_padding::Pkcs7, BlockDecryptMut, KeyIvInit};
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
-use blockcell_core::{Config, Error, InboundMessage, Result};
+use blockcell_core::{Config, Error, InboundMessage, Result, truncate_str};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -504,7 +504,7 @@ async fn download_lark_resource(
         .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
 
     let safe_key = resource_key.replace(['/', '\\', ':'], "_");
-    let filename = format!("lark_{}_{}.{}", resource_type, &safe_key[..safe_key.len().min(24)], ext);
+    let filename = format!("lark_{}_{}.{}", resource_type, truncate_str(&safe_key, 24), ext);
     let file_path = media_dir.join(&filename);
 
     let bytes = resp

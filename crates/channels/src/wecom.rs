@@ -4,7 +4,7 @@ use base64::{
     engine::{general_purpose, DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig},
     Engine as _,
 };
-use blockcell_core::{Config, Error, InboundMessage, Result};
+use blockcell_core::{Config, Error, InboundMessage, Result, truncate_str};
 use reqwest::Client;
 use serde::Deserialize;
 use std::collections::HashSet;
@@ -787,7 +787,7 @@ async fn download_wecom_media(
         .await
         .map_err(|e| Error::Channel(format!("Failed to create media dir: {}", e)))?;
 
-    let filename = format!("wecom_{}_{}.{}", media_type, &media_id[..media_id.len().min(16)], ext);
+    let filename = format!("wecom_{}_{}.{}", media_type, truncate_str(&media_id, 16), ext);
     let file_path = media_dir.join(&filename);
 
     let bytes = resp

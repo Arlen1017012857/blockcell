@@ -3497,7 +3497,16 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
     runtime.set_event_tx(ws_broadcast_tx.clone());
 
     // ── Create channel manager for outbound dispatch ──
-    let channel_manager = ChannelManager::new(config.clone(), paths.clone(), inbound_tx.clone());
+    let mut channel_manager = ChannelManager::new(config.clone(), paths.clone(), inbound_tx.clone());
+
+    // Pre-register the Feishu channel on channel_manager BEFORE wrapping in Arc,
+    // so the streaming bridge can intercept outbound messages.
+    #[cfg(feature = "feishu")]
+    let feishu_channel_arc = {
+        let feishu = Arc::new(FeishuChannel::new(config.clone(), inbound_tx.clone()));
+        channel_manager.set_feishu_channel(Arc::clone(&feishu));
+        feishu
+    };
 
     // ── Create session store ──
     let session_store = Arc::new(SessionStore::new(paths.clone()));
@@ -3614,8 +3623,15 @@ pub async fn run(cli_host: Option<String>, cli_port: Option<u16>) -> anyhow::Res
 
     #[cfg(feature = "feishu")]
     let feishu_handle = {
-        let feishu = Arc::new(FeishuChannel::new(config.clone(), inbound_tx.clone()));
+        let feishu = Arc::clone(&feishu_channel_arc);
         let shutdown_rx = shutdown_tx.subscribe();
+        let feishu_clone = Arc::clone(&feishu);
+        // Start the streaming bridge that forwards LLM token events to CardKit.
+        let streaming_shutdown_rx = shutdown_tx.subscribe();
+        let streaming_event_rx = ws_broadcast_tx.subscribe();
+        tokio::spawn(async move {
+            feishu_clone.run_streaming_bridge(streaming_event_rx, streaming_shutdown_rx).await;
+        });
         tokio::spawn(async move {
             feishu.run_loop(shutdown_rx).await;
         })

@@ -570,11 +570,11 @@ fn quote_python_str(s: &str) -> String {
 }
 
 fn truncate_str(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
+    let t = blockcell_core::truncate_str(s, max_chars);
+    if t.len() < s.len() {
+        format!("{}...", t)
     } else {
-        let truncated: String = s.chars().take(max_chars).collect();
-        format!("{}...", truncated)
+        t.to_string()
     }
 }
 

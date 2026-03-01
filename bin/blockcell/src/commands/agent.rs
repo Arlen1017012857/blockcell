@@ -293,7 +293,19 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
         let task_manager = TaskManager::new();
 
         // Create channel manager for outbound message dispatch (before config is moved)
-        let channel_manager = ChannelManager::new(config.clone(), paths.clone(), inbound_tx.clone());
+        let mut channel_manager = ChannelManager::new(config.clone(), paths.clone(), inbound_tx.clone());
+
+        // Create event broadcast channel for streaming events (used by feishu streaming bridge).
+        let (event_broadcast_tx, _) = broadcast::channel::<String>(1000);
+
+        // Pre-register the Feishu channel on channel_manager BEFORE it is moved,
+        // so the streaming bridge can intercept outbound messages.
+        #[cfg(feature = "feishu")]
+        let feishu_channel_arc = {
+            let feishu = Arc::new(FeishuChannel::new(config.clone(), inbound_tx.clone()));
+            channel_manager.set_feishu_channel(Arc::clone(&feishu));
+            feishu
+        };
 
         // Start messaging channels (before config is moved into runtime)
         #[cfg(feature = "telegram")]
@@ -316,8 +328,15 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
 
         #[cfg(feature = "feishu")]
         let feishu_handle = {
-            let feishu = Arc::new(FeishuChannel::new(config.clone(), inbound_tx.clone()));
+            let feishu = Arc::clone(&feishu_channel_arc);
             let shutdown_rx = shutdown_tx.subscribe();
+            let feishu_clone = Arc::clone(&feishu);
+            // Start the streaming bridge that forwards LLM token events to CardKit.
+            let streaming_shutdown_rx = shutdown_tx.subscribe();
+            let streaming_event_rx = event_broadcast_tx.subscribe();
+            tokio::spawn(async move {
+                feishu_clone.run_streaming_bridge(streaming_event_rx, streaming_shutdown_rx).await;
+            });
             tokio::spawn(async move {
                 feishu.run_loop(shutdown_rx).await;
             })
@@ -386,6 +405,7 @@ pub async fn run(message: Option<String>, session: String, model: Option<String>
         }
         runtime.set_capability_registry(cap_registry_handle.clone());
         runtime.set_core_evolution(core_evo_handle.clone());
+        runtime.set_event_tx(event_broadcast_tx.clone());
 
         // Create and start CronService
         let cron_service = Arc::new(CronService::new(paths.clone(), inbound_tx.clone()));

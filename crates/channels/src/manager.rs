@@ -12,6 +12,9 @@ pub struct ChannelManager {
     /// Persistent WhatsApp channel instance for connection reuse.
     #[cfg(feature = "whatsapp")]
     whatsapp_channel: Option<Arc<crate::whatsapp::WhatsAppChannel>>,
+    /// Persistent Feishu channel instance for streaming card support.
+    #[cfg(feature = "feishu")]
+    feishu_channel: Option<Arc<crate::feishu::FeishuChannel>>,
 }
 
 impl ChannelManager {
@@ -26,6 +29,8 @@ impl ChannelManager {
             inbound_tx,
             #[cfg(feature = "whatsapp")]
             whatsapp_channel: None,
+            #[cfg(feature = "feishu")]
+            feishu_channel: None,
         }
     }
 
@@ -34,6 +39,13 @@ impl ChannelManager {
     #[cfg(feature = "whatsapp")]
     pub fn set_whatsapp_channel(&mut self, ch: Arc<crate::whatsapp::WhatsAppChannel>) {
         self.whatsapp_channel = Some(ch);
+    }
+
+    /// Register the running Feishu channel so outbound messages can use
+    /// streaming card delivery when a draft is active.
+    #[cfg(feature = "feishu")]
+    pub fn set_feishu_channel(&mut self, ch: Arc<crate::feishu::FeishuChannel>) {
+        self.feishu_channel = Some(ch);
     }
 
     pub async fn start_outbound_dispatcher(
@@ -87,6 +99,19 @@ impl ChannelManager {
             "feishu" => {
                 #[cfg(feature = "feishu")]
                 {
+                    // If a streaming card is active for this chat, skip normal send —
+                    // the streaming bridge handles delivery via CardKit.
+                    let has_active_draft = if let Some(ref ch) = self.feishu_channel {
+                        ch.get_active_draft(&msg.chat_id).await.is_some()
+                    } else {
+                        false
+                    };
+
+                    if has_active_draft {
+                        tracing::debug!(chat_id = %msg.chat_id, "Feishu: skipping normal send — streaming card active");
+                        return Ok(());
+                    }
+
                     if !msg.media.is_empty() {
                         for file_path in &msg.media {
                             if let Err(e) = crate::feishu::send_media_message(

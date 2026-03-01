@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use blockcell_core::{Error, Result};
+use blockcell_core::{Error, Result, truncate_str};
 use reqwest::Client;
 use serde_json::{json, Value};
 use tracing::debug;
@@ -98,7 +98,7 @@ async fn execute_macos(action: &str, params: &Value, ctx: &ToolContext) -> Resul
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     serde_json::from_str(&stdout)
-        .map_err(|e| Error::Tool(format!("Failed to parse contacts output: {} — raw: {}", e, &stdout[..stdout.len().min(200)])))
+        .map_err(|e| Error::Tool(format!("Failed to parse contacts output: {} — raw: {}", e, truncate_str(&stdout, 200))))
 }
 
 fn build_macos_script(action: &str, params: &Value, workspace: &std::path::Path) -> Result<String> {
@@ -534,7 +534,7 @@ async fn execute_carddav(action: &str, params: &Value, ctx: &ToolContext) -> Res
                 .map_err(|e| Error::Tool(format!("Failed to read CardDAV response: {}", e)))?;
 
             if !status.is_success() && status.as_u16() != 207 {
-                return Err(Error::Tool(format!("CardDAV error ({}): {}", status, &text[..text.len().min(500)])));
+                return Err(Error::Tool(format!("CardDAV error ({}): {}", status, truncate_str(&text, 500))));
             }
 
             // Parse vCards from response (simplified)

@@ -1,11 +1,12 @@
 use futures::{SinkExt, StreamExt};
-use blockcell_core::{Config, Error, InboundMessage, Result};
+use blockcell_core::{Config, Error, InboundMessage, Result, truncate_str};
 use prost::Message as _;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
@@ -54,6 +55,176 @@ const FEISHU_OPEN_API: &str = "https://open.feishu.cn/open-apis";
 const FEISHU_BASE: &str = "https://open.feishu.cn";
 /// Refresh token 5 minutes before expiry.
 const TOKEN_REFRESH_MARGIN_SECS: i64 = 300;
+/// Feishu API business code for expired/invalid tenant access token.
+const FEISHU_INVALID_TOKEN_CODE: i64 = 99_991_663;
+/// Minimum interval between streaming card updates (throttle).
+const STREAMING_UPDATE_INTERVAL_MS: u64 = 100;
+
+// ---------------------------------------------------------------------------
+// Streaming card helpers
+// ---------------------------------------------------------------------------
+
+/// Per-card streaming update throttle state.
+struct CardStreamState {
+    /// Last time a streaming update was successfully sent for this card.
+    last_update_time: Option<Instant>,
+    /// Text that was skipped due to throttling (sent on next eligible update).
+    pending_text: Option<String>,
+    /// Sequence counter for CardKit update ordering.
+    sequence: u64,
+    /// When this card was created (for stale draft cleanup).
+    created_at: Instant,
+    /// Whether this card was created with a collapsible_panel for reasoning.
+    has_collapsible: bool,
+}
+
+impl Default for CardStreamState {
+    fn default() -> Self {
+        Self {
+            last_update_time: None,
+            pending_text: None,
+            sequence: 0,
+            created_at: Instant::now(),
+            has_collapsible: false,
+        }
+    }
+}
+
+/// Streaming state across all active cards.
+#[derive(Default)]
+struct StreamingThrottleState {
+    /// Per-card state keyed by card_id.
+    cards: HashMap<String, CardStreamState>,
+}
+
+/// Encode a card_id and message_id into a draft identifier.
+///
+/// Format: `card:{card_id}:msg:{message_id}`
+fn encode_draft_id(card_id: &str, message_id: &str) -> String {
+    format!("card:{card_id}:msg:{message_id}")
+}
+
+/// Decode a draft identifier into `(card_id, message_id)`.
+fn decode_draft_id(draft_id: &str) -> std::result::Result<(&str, &str), Error> {
+    let rest = draft_id
+        .strip_prefix("card:")
+        .ok_or_else(|| Error::Channel("invalid draft id: missing 'card:' prefix".into()))?;
+    let (card_id, msg_part) = rest
+        .split_once(":msg:")
+        .ok_or_else(|| Error::Channel("invalid draft id: missing ':msg:' separator".into()))?;
+    if card_id.is_empty() || msg_part.is_empty() {
+        return Err(Error::Channel("invalid draft id: empty card_id or message_id".into()));
+    }
+    Ok((card_id, msg_part))
+}
+
+/// Truncate summary text to at most `max_len` characters.
+fn truncate_summary(text: &str, max_len: usize) -> String {
+    let clean = text.replace('\n', " ").trim().to_string();
+    if clean.chars().count() <= max_len {
+        clean
+    } else {
+        let truncated: String = clean.chars().take(max_len.saturating_sub(3)).collect();
+        format!("{truncated}...")
+    }
+}
+
+/// Extract `code` from a Feishu API response body.
+fn extract_response_code(body: &serde_json::Value) -> Option<i64> {
+    body.get("code").and_then(|c| c.as_i64())
+}
+
+/// Extract `data.message_id` from a Feishu API response body.
+fn extract_message_id(body: &serde_json::Value) -> std::result::Result<String, Error> {
+    body.pointer("/data/message_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| Error::Channel(format!("missing data.message_id in Feishu response: {body}")))
+}
+
+/// Compose the streaming card markdown from reasoning, tool trace, and content.
+///
+/// - `reasoning`: native model thinking (from ReasoningDelta events)
+/// - `tool_trace`: tool execution status lines (✅/❌)
+/// - `content`: actual LLM response text
+///
+/// The "thinking" section combines reasoning + tool_trace as a quoted block.
+/// A `---` divider separates thinking from content.
+/// Sanitize markdown for Feishu CardKit compatibility.
+///
+/// Feishu card markdown elements support: **bold**, *italic*, ~~strikethrough~~,
+/// `code`, ```code blocks```, [link](url), > quote, ---, ordered/unordered lists.
+/// They do NOT reliably render `#`/`##`/`###` headers or `- **key**: value` patterns.
+///
+/// This function converts unsupported patterns to Feishu-friendly equivalents.
+fn sanitize_feishu_markdown(text: &str) -> String {
+    let mut result = String::with_capacity(text.len());
+    let mut in_code_block = false;
+
+    for line in text.lines() {
+        if !result.is_empty() {
+            result.push('\n');
+        }
+
+        // Don't transform inside fenced code blocks.
+        if line.trim_start().starts_with("```") {
+            in_code_block = !in_code_block;
+            result.push_str(line);
+            continue;
+        }
+        if in_code_block {
+            result.push_str(line);
+            continue;
+        }
+
+        // Convert `# Header` → `**Header**` (all levels).
+        let trimmed = line.trim_start();
+        if trimmed.starts_with('#') {
+            let hashes_end = trimmed.find(|c: char| c != '#').unwrap_or(trimmed.len());
+            if hashes_end <= 6 {
+                let rest = trimmed[hashes_end..].trim();
+                if !rest.is_empty() {
+                    // Preserve leading whitespace from original line.
+                    let indent = &line[..line.len() - trimmed.len()];
+                    result.push_str(indent);
+                    result.push_str("**");
+                    result.push_str(rest);
+                    result.push_str("**");
+                    continue;
+                }
+            }
+        }
+
+        result.push_str(line);
+    }
+
+    result
+}
+
+fn compose_streaming_card_full(reasoning: &str, tool_trace: &str, content: &str) -> String {
+    // Build the thinking section: reasoning + tool trace, separated by divider.
+    let thinking = match (reasoning.is_empty(), tool_trace.is_empty()) {
+        (true, true) => String::new(),
+        (false, true) => reasoning.to_string(),
+        (true, false) => tool_trace.to_string(),
+        (false, false) => format!("{reasoning}\n\n---\n\n{tool_trace}"),
+    };
+
+    if thinking.is_empty() {
+        return sanitize_feishu_markdown(content);
+    }
+
+    let quoted = thinking.lines().map(|l| format!("> {l}")).collect::<Vec<_>>().join("\n");
+
+    if content.is_empty() {
+        // Still in thinking phase.
+        return format!("💭 **思考中...**\n{quoted}");
+    }
+
+    // Both present — show thinking as quoted block, then separator, then content.
+    let sanitized_content = sanitize_feishu_markdown(content);
+    format!("💭 **思考过程**\n{quoted}\n\n---\n\n{sanitized_content}")
+}
 
 /// Cached tenant access token with expiry timestamp.
 #[derive(Default)]
@@ -177,6 +348,13 @@ pub struct FeishuChannel {
     token_cache: Arc<Mutex<CachedToken>>,
     /// Directory for downloaded media files.
     media_dir: PathBuf,
+    /// Whether streaming card feature is enabled.
+    streaming_enabled: bool,
+    /// Streaming card throttle state.
+    streaming_state: Arc<Mutex<StreamingThrottleState>>,
+    /// Active streaming drafts: chat_id → draft_id.
+    /// Used by the streaming bridge to route token events to the correct card.
+    active_drafts: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl FeishuChannel {
@@ -191,6 +369,8 @@ impl FeishuChannel {
             .unwrap_or_else(|_| PathBuf::from("workspace"))
             .join("media");
 
+        let streaming_enabled = config.channels.feishu.streaming;
+
         Self {
             config,
             inbound_tx,
@@ -198,6 +378,9 @@ impl FeishuChannel {
             seen_messages: Arc::new(Mutex::new(HashSet::new())),
             token_cache: Arc::new(Mutex::new(CachedToken::default())),
             media_dir,
+            streaming_enabled,
+            streaming_state: Arc::new(Mutex::new(StreamingThrottleState::default())),
+            active_drafts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -255,19 +438,19 @@ impl FeishuChannel {
         }
 
         let endpoint_resp: WsEndpointResponse = serde_json::from_str(&body)
-            .map_err(|e| Error::Channel(format!("Failed to parse endpoint response: {} | body: {}", e, &body[..body.len().min(500)])))?;
+            .map_err(|e| Error::Channel(format!("Failed to parse endpoint response: {} | body: {}", e, truncate_str(&body, 500))))?;
 
         if endpoint_resp.code != 0 {
             return Err(Error::Channel(format!(
                 "Feishu endpoint error code={} msg={} | body: {}",
-                endpoint_resp.code, endpoint_resp.msg, &body[..body.len().min(500)]
+                endpoint_resp.code, endpoint_resp.msg, truncate_str(&body, 500)
             )));
         }
 
         endpoint_resp
             .data
             .map(|d| d.url)
-            .ok_or_else(|| Error::Channel(format!("No endpoint URL in response | body: {}", &body[..body.len().min(500)])))
+            .ok_or_else(|| Error::Channel(format!("No endpoint URL in response | body: {}", truncate_str(&body, 500))))
     }
 
     pub async fn run_loop(self: Arc<Self>, mut shutdown: tokio::sync::broadcast::Receiver<()>) {
@@ -366,7 +549,7 @@ impl FeishuChannel {
                                 debug!(method = frame.method, msg_type = %msg_type, payload_len = frame.payload.len(), "Feishu data frame");
                                 match std::str::from_utf8(&frame.payload) {
                                     Ok(text) => {
-                                        info!(payload = %&text[..text.len().min(500)], "Feishu raw event payload");
+                                        info!(payload = %truncate_str(text, 500), "Feishu raw event payload");
                                         // Send ACK frame
                                         let ack = Frame {
                                             seq_id: frame.seq_id,
@@ -489,7 +672,7 @@ impl FeishuChannel {
 
     async fn handle_message(&self, text: &str) -> Result<()> {
         let event: FeishuEvent = serde_json::from_str(text).map_err(|e| {
-            warn!(error = %e, raw = %&text[..text.len().min(500)], "Failed to parse Feishu event");
+            warn!(error = %e, raw = %truncate_str(text, 500), "Failed to parse Feishu event");
             Error::Channel(format!("Failed to parse Feishu event: {}", e))
         })?;
 
@@ -633,12 +816,1026 @@ impl FeishuChannel {
             timestamp_ms: chrono::Utc::now().timestamp_millis(),
         };
 
+        // Create a streaming card before forwarding the message to the runtime.
+        // This way, when the LLM starts streaming tokens, the card is already
+        // in place and the streaming bridge can forward deltas to it.
+        match self.send_streaming_start(&message.chat_id).await {
+            Ok(Some(draft_id)) => {
+                info!(chat_id = %message.chat_id, draft_id = %draft_id, "Feishu: streaming card created");
+            }
+            Ok(None) => {
+                debug!(chat_id = %message.chat_id, "Feishu: streaming not available, using normal send");
+            }
+            Err(e) => {
+                warn!(error = %e, chat_id = %message.chat_id, "Feishu: failed to create streaming card, falling back to normal send");
+            }
+        }
+
         self.inbound_tx
             .send(inbound)
             .await
             .map_err(|e| Error::Channel(e.to_string()))?;
 
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Streaming card (CardKit) support
+    // -----------------------------------------------------------------------
+
+    /// Invalidate the cached token (called when API reports an expired token).
+    async fn invalidate_token(&self) {
+        let mut cache = self.token_cache.lock().await;
+        cache.token.clear();
+        cache.expires_at = 0;
+    }
+
+    /// Send a raw HTTP request and return (status, parsed JSON body).
+    async fn send_request_once(
+        &self,
+        url: &str,
+        token: &str,
+        body: &serde_json::Value,
+    ) -> Result<(reqwest::StatusCode, serde_json::Value)> {
+        let resp = self
+            .client
+            .post(url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(body)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("Feishu request failed: {e}")))?;
+        let status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+        Ok((status, parsed))
+    }
+
+    /// Check if the response indicates an invalid/expired token.
+    fn should_refresh_token(status: reqwest::StatusCode, body: &serde_json::Value) -> bool {
+        status == reqwest::StatusCode::UNAUTHORIZED
+            || extract_response_code(body) == Some(FEISHU_INVALID_TOKEN_CODE)
+    }
+
+    /// Send a message and return the `message_id` from the response.
+    async fn send_message_with_id(
+        &self,
+        chat_id: &str,
+        msg_type: &str,
+        content: &str,
+    ) -> Result<String> {
+        let token = self.get_tenant_access_token().await?;
+        let url = format!("{}/im/v1/messages?receive_id_type=chat_id", FEISHU_OPEN_API);
+
+        let wire_content = if msg_type == "text" {
+            serde_json::json!({ "text": content }).to_string()
+        } else {
+            content.to_string()
+        };
+
+        let body = serde_json::json!({
+            "receive_id": chat_id,
+            "msg_type": msg_type,
+            "content": wire_content,
+        });
+
+        let (status, response) = self.send_request_once(&url, &token, &body).await?;
+
+        if Self::should_refresh_token(status, &response) {
+            self.invalidate_token().await;
+            let new_token = self.get_tenant_access_token().await?;
+            let (retry_status, retry_response) =
+                self.send_request_once(&url, &new_token, &body).await?;
+
+            if !retry_status.is_success() || extract_response_code(&retry_response).unwrap_or(0) != 0 {
+                return Err(Error::Channel(format!(
+                    "Feishu send_message_with_id failed after token refresh: status={retry_status}, body={retry_response}"
+                )));
+            }
+            return extract_message_id(&retry_response);
+        }
+
+        let code = extract_response_code(&response).unwrap_or(0);
+        if !status.is_success() || code != 0 {
+            return Err(Error::Channel(format!(
+                "Feishu send_message_with_id failed: status={status}, body={response}"
+            )));
+        }
+        extract_message_id(&response)
+    }
+
+    /// Create a streaming card entity via CardKit API.
+    ///
+    /// Returns the `card_id` from the response.
+    /// Returns `(card_id, has_collapsible)`.
+    async fn cardkit_create_card(&self, token: &str) -> Result<(String, bool)> {
+        let url = format!("{}/cardkit/v1/cards", FEISHU_OPEN_API);
+
+        // Try creating a card with collapsible_panel for reasoning.
+        // If the API rejects it (e.g. collapsible_panel not supported),
+        // fall back to a simple single-element card.
+        let card_json_with_panel = serde_json::json!({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": true,
+                "summary": { "content": "[生成中...]" },
+                "streaming_config": {
+                    "print_frequency_ms": { "default": 50 },
+                    "print_step": { "default": 2 }
+                }
+            },
+            "body": {
+                "elements": [
+                    {
+                        "tag": "collapsible_panel",
+                        "expanded": false,
+                        "background": {
+                            "color": "bg-fill-tag-purple"
+                        },
+                        "header": {
+                            "title": {
+                                "tag": "plain_text",
+                                "content": "💭 思考过程（点击展开）"
+                            },
+                            "vertical_align": "center"
+                        },
+                        "vertical_spacing": "8px",
+                        "element_id": "thinking_panel",
+                        "elements": [{
+                            "tag": "markdown",
+                            "content": "",
+                            "element_id": "thinking_md"
+                        }]
+                    },
+                    {
+                        "tag": "markdown",
+                        "content": "⏳",
+                        "element_id": "content"
+                    }
+                ]
+            }
+        });
+
+        let body_with_panel = serde_json::json!({
+            "type": "card_json",
+            "data": card_json_with_panel.to_string(),
+        });
+
+        let result = self.send_request_once(&url, token, &body_with_panel).await;
+
+        match result {
+            Ok((_status, response)) => {
+                let code = extract_response_code(&response).unwrap_or(0);
+                if code == 0 {
+                    if let Some(card_id) = response.pointer("/data/card_id").and_then(|v| v.as_str()) {
+                        info!("CardKit card created with collapsible_panel");
+                        return Ok((card_id.to_string(), true));
+                    }
+                }
+                // collapsible_panel rejected — fall through to simple card
+                let msg = response.get("msg").and_then(|v| v.as_str()).unwrap_or("unknown");
+                warn!("CardKit create with collapsible_panel failed (code={code}, msg={msg}), falling back to simple card");
+            }
+            Err(e) => {
+                warn!("CardKit create with collapsible_panel request failed: {e}, falling back to simple card");
+            }
+        }
+
+        // Fallback: simple single-element card (no collapsible panel).
+        let card_json_simple = serde_json::json!({
+            "schema": "2.0",
+            "config": {
+                "streaming_mode": true,
+                "summary": { "content": "[生成中...]" },
+                "streaming_config": {
+                    "print_frequency_ms": { "default": 50 },
+                    "print_step": { "default": 2 }
+                }
+            },
+            "body": {
+                "elements": [{
+                    "tag": "markdown",
+                    "content": "⏳",
+                    "element_id": "content"
+                }]
+            }
+        });
+
+        let body_simple = serde_json::json!({
+            "type": "card_json",
+            "data": card_json_simple.to_string(),
+        });
+
+        let (_status, response) = self.send_request_once(&url, token, &body_simple).await?;
+
+        let code = extract_response_code(&response).unwrap_or(0);
+        if code != 0 {
+            let msg = response
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(Error::Channel(format!(
+                "CardKit create card failed: code={code}, msg={msg}"
+            )));
+        }
+
+        response
+            .pointer("/data/card_id")
+            .and_then(|v| v.as_str())
+            .map(|s| (s.to_string(), false))
+            .ok_or_else(|| Error::Channel(format!("missing data.card_id in CardKit response: {response}")))
+    }
+
+    /// Update the markdown content of a streaming card element.
+    async fn cardkit_update_content(
+        &self,
+        token: &str,
+        card_id: &str,
+        content: &str,
+        sequence: u64,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/cardkit/v1/cards/{}/elements/content/content",
+            FEISHU_OPEN_API, card_id,
+        );
+
+        let uuid = format!("s_{card_id}_{sequence}");
+
+        let body = serde_json::json!({
+            "content": content,
+            "sequence": sequence,
+            "uuid": uuid,
+        });
+
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("CardKit update content request failed: {e}")))?;
+        let _status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+        let code = extract_response_code(&parsed).unwrap_or(0);
+        if code != 0 {
+            let msg = parsed
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(Error::Channel(format!(
+                "CardKit update content failed: code={code}, msg={msg}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Update the content of a specific element in a CardKit card by its element_id.
+    /// This is used to update the thinking_md element inside the collapsible panel.
+    async fn cardkit_update_element(
+        &self,
+        token: &str,
+        card_id: &str,
+        element_id: &str,
+        content: &str,
+        sequence: u64,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/cardkit/v1/cards/{}/elements/{}/content",
+            FEISHU_OPEN_API, card_id, element_id,
+        );
+
+        let uuid = format!("e_{card_id}_{element_id}_{sequence}");
+
+        let body = serde_json::json!({
+            "content": content,
+            "sequence": sequence,
+            "uuid": uuid,
+        });
+
+        let resp = self
+            .client
+            .put(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("CardKit update element '{element_id}' request failed: {e}")))?;
+        let _status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+        let code = extract_response_code(&parsed).unwrap_or(0);
+        if code != 0 {
+            let msg = parsed
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(Error::Channel(format!(
+                "CardKit update element '{element_id}' failed: code={code}, msg={msg}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    /// Close streaming mode on a CardKit card.
+    async fn cardkit_close_streaming(
+        &self,
+        token: &str,
+        card_id: &str,
+        summary: &str,
+        sequence: u64,
+    ) -> Result<()> {
+        let url = format!(
+            "{}/cardkit/v1/cards/{}/settings",
+            FEISHU_OPEN_API, card_id,
+        );
+
+        let uuid = format!("c_{card_id}_{sequence}");
+
+        let settings = serde_json::json!({
+            "config": {
+                "streaming_mode": false,
+                "summary": { "content": summary }
+            }
+        });
+
+        let body = serde_json::json!({
+            "settings": settings.to_string(),
+            "sequence": sequence,
+            "uuid": uuid,
+        });
+
+        let resp = self
+            .client
+            .patch(&url)
+            .header("Authorization", format!("Bearer {token}"))
+            .header("Content-Type", "application/json; charset=utf-8")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| Error::Channel(format!("CardKit close streaming request failed: {e}")))?;
+        let _status = resp.status();
+        let raw = resp.text().await.unwrap_or_default();
+        let parsed = serde_json::from_str::<serde_json::Value>(&raw)
+            .unwrap_or_else(|_| serde_json::json!({ "raw": raw }));
+
+        let code = extract_response_code(&parsed).unwrap_or(0);
+        if code != 0 {
+            let msg = parsed
+                .get("msg")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown error");
+            return Err(Error::Channel(format!(
+                "CardKit close streaming failed: code={code}, msg={msg}"
+            )));
+        }
+
+        Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Public streaming API
+    // -----------------------------------------------------------------------
+
+    /// Start a streaming card: create a CardKit card, send it as an interactive
+    /// message, and return the encoded draft ID.
+    ///
+    /// Returns `Ok(Some(draft_id))` on success, `Ok(None)` if streaming is not
+    /// available (e.g. token failure).
+    pub async fn send_streaming_start(&self, chat_id: &str) -> Result<Option<String>> {
+        if !self.streaming_enabled {
+            return Ok(None);
+        }
+
+        let token = self.get_tenant_access_token().await?;
+
+        // Create streaming card (with one token-refresh retry).
+        let (card_id, has_collapsible) = match self.cardkit_create_card(&token).await {
+            Ok(result) => result,
+            Err(first_err) => {
+                if first_err.to_string().contains("99991663") {
+                    self.invalidate_token().await;
+                    let new_token = self.get_tenant_access_token().await?;
+                    self.cardkit_create_card(&new_token).await?
+                } else {
+                    return Err(first_err);
+                }
+            }
+        };
+
+        // Send interactive message with the card.
+        let content = serde_json::json!({
+            "type": "card",
+            "data": { "card_id": &card_id }
+        })
+        .to_string();
+
+        let message_id = self
+            .send_message_with_id(chat_id, "interactive", &content)
+            .await?;
+
+        // Initialize per-card state.
+        {
+            let mut state = self.streaming_state.lock().await;
+            state.cards.insert(card_id.clone(), CardStreamState {
+                last_update_time: None,
+                pending_text: None,
+                sequence: 1,
+                created_at: Instant::now(),
+                has_collapsible,
+            });
+        }
+
+        let draft_id = encode_draft_id(&card_id, &message_id);
+
+        // Track active draft for this chat_id.
+        {
+            let mut drafts = self.active_drafts.lock().await;
+            drafts.insert(chat_id.to_string(), draft_id.clone());
+        }
+
+        Ok(Some(draft_id))
+    }
+
+    /// Update the streaming card content (throttled per-card to avoid API rate limits).
+    pub async fn send_streaming_update(&self, draft_id: &str, text: &str) -> Result<()> {
+        let (card_id, _msg_id) = decode_draft_id(draft_id)?;
+        let card_id = card_id.to_string();
+
+        let mut state = self.streaming_state.lock().await;
+
+        let card = match state.cards.get_mut(&card_id) {
+            Some(c) => c,
+            None => return Ok(()), // card already cleaned up
+        };
+
+        // Throttle: if less than STREAMING_UPDATE_INTERVAL_MS since last update, save pending.
+        let now = Instant::now();
+        if let Some(last) = card.last_update_time {
+            if now.duration_since(last) < std::time::Duration::from_millis(STREAMING_UPDATE_INTERVAL_MS) {
+                card.pending_text = Some(text.to_string());
+                return Ok(());
+            }
+        }
+
+        // Increment sequence number.
+        card.sequence += 1;
+        let sequence = card.sequence;
+
+        // Clear pending since we're sending the latest text now.
+        card.pending_text = None;
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("streaming update: failed to get token: {e}");
+                return Ok(());
+            }
+        };
+
+        match self.cardkit_update_content(&token, &card_id, text, sequence).await {
+            Ok(()) => {
+                // Re-acquire card ref after async call (state lock was held across await,
+                // but Mutex is held for the entire method).
+                if let Some(card) = state.cards.get_mut(&card_id) {
+                    card.last_update_time = Some(Instant::now());
+                }
+            }
+            Err(e) => {
+                // Token expired during update — retry once.
+                if Self::should_refresh_token(reqwest::StatusCode::OK, &serde_json::json!({}))
+                    || e.to_string().contains("99991663")
+                {
+                    self.invalidate_token().await;
+                    if let Ok(new_token) = self.get_tenant_access_token().await {
+                        if let Err(e2) = self.cardkit_update_content(&new_token, &card_id, text, sequence).await {
+                            warn!("streaming update: retry after token refresh failed: {e2}");
+                        } else if let Some(card) = state.cards.get_mut(&card_id) {
+                            card.last_update_time = Some(Instant::now());
+                        }
+                    }
+                } else {
+                    warn!("streaming update: cardkit_update_content failed: {e}");
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Finalize the streaming card: send final content and close streaming mode.
+    pub async fn send_streaming_finalize(&self, draft_id: &str, text: &str) -> Result<()> {
+        let (card_id, _msg_id) = decode_draft_id(draft_id)?;
+        let card_id = card_id.to_string();
+
+        let mut state = self.streaming_state.lock().await;
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("streaming finalize: failed to get token: {e}");
+                state.cards.remove(&card_id);
+                return Ok(());
+            }
+        };
+
+        // Get current sequence (or default).
+        let cur_seq = state.cards.get(&card_id).map(|c| c.sequence).unwrap_or(1);
+
+        // Send final content update.
+        let update_seq = cur_seq + 1;
+        if let Err(e) = self
+            .cardkit_update_content(&token, &card_id, text, update_seq)
+            .await
+        {
+            warn!("streaming finalize: final content update failed: {e}");
+        }
+
+        // Close streaming mode.
+        let close_seq = update_seq + 1;
+        let summary = truncate_summary(text, 50);
+        if let Err(e) = self
+            .cardkit_close_streaming(&token, &card_id, &summary, close_seq)
+            .await
+        {
+            warn!("streaming finalize: cardkit_close_streaming failed: {e}");
+        }
+
+        // Clean up.
+        state.cards.remove(&card_id);
+
+        // Remove from active drafts.
+        {
+            let mut drafts = self.active_drafts.lock().await;
+            drafts.retain(|_, v| v != draft_id);
+        }
+
+        Ok(())
+    }
+
+    /// Finalize a streaming card with a collapsible panel for reasoning content.
+    /// Replaces the card body with structured JSON elements instead of plain markdown.
+    pub async fn send_streaming_finalize_collapsible(
+        &self,
+        draft_id: &str,
+        reasoning: &str,
+        tool_trace: &str,
+        content: &str,
+    ) -> Result<()> {
+        let (card_id, _msg_id) = decode_draft_id(draft_id)?;
+        let card_id = card_id.to_string();
+
+        let mut state = self.streaming_state.lock().await;
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("streaming finalize collapsible: failed to get token: {e}");
+                state.cards.remove(&card_id);
+                return Ok(());
+            }
+        };
+
+        let cur_seq = state.cards.get(&card_id).map(|c| c.sequence).unwrap_or(1);
+        let mut seq = cur_seq;
+
+        // Build the thinking text (reasoning + tool trace), separated by dividers.
+        let thinking = match (reasoning.is_empty(), tool_trace.is_empty()) {
+            (true, true) => String::new(),
+            (false, true) => reasoning.to_string(),
+            (true, false) => tool_trace.to_string(),
+            (false, false) => format!("{reasoning}\n\n---\n\n{tool_trace}"),
+        };
+
+        // Update the thinking_md element inside the collapsible panel.
+        if !thinking.is_empty() {
+            let sanitized_thinking = sanitize_feishu_markdown(&thinking);
+            seq += 1;
+            if let Err(e) = self
+                .cardkit_update_element(&token, &card_id, "thinking_md", &sanitized_thinking, seq)
+                .await
+            {
+                warn!("streaming finalize collapsible: thinking_md update failed: {e}");
+            }
+        }
+
+        // Update the content element with clean content (no reasoning blockquotes).
+        let sanitized_content = sanitize_feishu_markdown(content);
+        seq += 1;
+        if let Err(e) = self
+            .cardkit_update_content(&token, &card_id, &sanitized_content, seq)
+            .await
+        {
+            warn!("streaming finalize collapsible: content update failed: {e}");
+        }
+
+        // Close streaming mode.
+        seq += 1;
+        let summary = truncate_summary(content, 50);
+        if let Err(e) = self
+            .cardkit_close_streaming(&token, &card_id, &summary, seq)
+            .await
+        {
+            warn!("streaming finalize collapsible: cardkit_close_streaming failed: {e}");
+        }
+
+        // Clean up.
+        state.cards.remove(&card_id);
+
+        {
+            let mut drafts = self.active_drafts.lock().await;
+            drafts.retain(|_, v| v != draft_id);
+        }
+
+        Ok(())
+    }
+
+    /// Cancel the streaming card: close streaming mode without final content.
+    pub async fn send_streaming_cancel(&self, draft_id: &str) -> Result<()> {
+        let (card_id, _msg_id) = decode_draft_id(draft_id)?;
+        let card_id = card_id.to_string();
+
+        let mut state = self.streaming_state.lock().await;
+
+        let token = match self.get_tenant_access_token().await {
+            Ok(t) => t,
+            Err(e) => {
+                warn!("streaming cancel: failed to get token: {e}");
+                state.cards.remove(&card_id);
+                return Ok(());
+            }
+        };
+
+        let cur_seq = state.cards.get(&card_id).map(|c| c.sequence).unwrap_or(1);
+        let close_seq = cur_seq + 1;
+
+        if let Err(e) = self
+            .cardkit_close_streaming(&token, &card_id, "", close_seq)
+            .await
+        {
+            warn!("streaming cancel: cardkit_close_streaming failed: {e}");
+        }
+
+        state.cards.remove(&card_id);
+
+        // Remove from active drafts.
+        {
+            let mut drafts = self.active_drafts.lock().await;
+            drafts.retain(|_, v| v != draft_id);
+        }
+
+        Ok(())
+    }
+
+    /// Get the active draft ID for a chat, if any.
+    pub async fn get_active_draft(&self, chat_id: &str) -> Option<String> {
+        let drafts = self.active_drafts.lock().await;
+        drafts.get(chat_id).cloned()
+    }
+
+    /// Check if a card was created with the collapsible panel layout.
+    async fn card_has_collapsible(&self, draft_id: &str) -> bool {
+        let (card_id, _) = match decode_draft_id(draft_id) {
+            Ok(ids) => ids,
+            Err(_) => return false,
+        };
+        let state = self.streaming_state.lock().await;
+        state.cards.get(card_id).map(|c| c.has_collapsible).unwrap_or(false)
+    }
+
+    /// Start the streaming bridge: subscribes to the event broadcast channel
+    /// and forwards LLM streaming tokens to active Feishu streaming cards.
+    ///
+    /// This should be spawned as a background task alongside `run_loop`.
+    /// When a `token` event arrives for a chat_id that has an active streaming
+    /// card, the delta is accumulated and forwarded to CardKit.
+    /// When a `message_done` event arrives, the card is finalized.
+    pub async fn run_streaming_bridge(
+        self: Arc<Self>,
+        mut event_rx: tokio::sync::broadcast::Receiver<String>,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) {
+        if !self.streaming_enabled {
+            info!("Feishu streaming bridge disabled by config");
+            return;
+        }
+
+        // Per-chat accumulated text for streaming updates.
+        let accumulated: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Per-chat accumulated reasoning (thinking) content.
+        let reasoning: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Per-chat accumulated tool execution trace (✅/❌ lines).
+        let tool_trace: Arc<Mutex<HashMap<String, String>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        // Stale draft cleanup interval (5 minutes).
+        let mut cleanup_interval = tokio::time::interval(std::time::Duration::from_secs(300));
+        cleanup_interval.tick().await; // consume immediate tick
+
+        loop {
+            tokio::select! {
+                event = event_rx.recv() => {
+                    let event_str = match event {
+                        Ok(s) => s,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                            warn!("Feishu streaming bridge lagged {n} events");
+                            continue;
+                        }
+                        Err(_) => break,
+                    };
+
+                    let parsed: serde_json::Value = match serde_json::from_str(&event_str) {
+                        Ok(v) => v,
+                        Err(_) => continue,
+                    };
+
+                    let event_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    let chat_id = parsed.get("chat_id").and_then(|v| v.as_str()).unwrap_or("");
+
+                    if chat_id.is_empty() {
+                        continue;
+                    }
+
+                    // Check if this chat has an active streaming draft.
+                    let draft_id = {
+                        let drafts = self.active_drafts.lock().await;
+                        drafts.get(chat_id).cloned()
+                    };
+                    let draft_id = match draft_id {
+                        Some(id) => id,
+                        None => continue,
+                    };
+
+                    match event_type {
+                        "thinking" => {
+                            let delta = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            if delta.is_empty() {
+                                continue;
+                            }
+                            debug!(
+                                delta_len = delta.len(),
+                                chat_id = chat_id,
+                                "Feishu streaming bridge received 'thinking' event"
+                            );
+
+                            // Accumulate reasoning text.
+                            let (reasoning_text, trace_text, content_text) = {
+                                let mut reas = reasoning.lock().await;
+                                let entry = reas.entry(chat_id.to_string()).or_default();
+                                entry.push_str(delta);
+                                let r = entry.clone();
+                                let tt = tool_trace.lock().await;
+                                let t = tt.get(chat_id).cloned().unwrap_or_default();
+                                let acc = accumulated.lock().await;
+                                let c = acc.get(chat_id).cloned().unwrap_or_default();
+                                (r, t, c)
+                            };
+
+                            let card_text = compose_streaming_card_full(&reasoning_text, &trace_text, &content_text);
+
+                            if let Err(e) = self.send_streaming_update(&draft_id, &card_text).await {
+                                warn!("Feishu streaming bridge thinking update failed: {e}");
+                            }
+                        }
+                        "tool_call_start" => {
+                            let tool_name = parsed.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+
+                            // Show tool execution status on the card.
+                            let (reasoning_text, trace_text, content_text) = {
+                                let reas = reasoning.lock().await;
+                                let r = reas.get(chat_id).cloned().unwrap_or_default();
+                                let tt = tool_trace.lock().await;
+                                let t = tt.get(chat_id).cloned().unwrap_or_default();
+                                let acc = accumulated.lock().await;
+                                let c = acc.get(chat_id).cloned().unwrap_or_default();
+                                (r, t, c)
+                            };
+
+                            // Append "calling tool" line to tool trace (shown in thinking block).
+                            let live_trace = if trace_text.is_empty() {
+                                format!("🔧 正在调用工具: `{tool_name}` ...")
+                            } else {
+                                format!("{trace_text}\n🔧 正在调用工具: `{tool_name}` ...")
+                            };
+
+                            let card_text = compose_streaming_card_full(&reasoning_text, &live_trace, &content_text);
+
+                            if let Err(e) = self.send_streaming_update(&draft_id, &card_text).await {
+                                warn!("Feishu streaming bridge tool_call_start update failed: {e}");
+                            }
+                        }
+                        "tool_call_result" => {
+                            let tool_name = parsed.get("tool").and_then(|v| v.as_str()).unwrap_or("unknown");
+                            let duration_ms = parsed.get("duration_ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                            let is_error = parsed.pointer("/result/error").is_some();
+
+                            let status_icon = if is_error { "❌" } else { "✅" };
+                            let duration_str = if duration_ms > 1000 {
+                                format!("{:.1}s", duration_ms as f64 / 1000.0)
+                            } else {
+                                format!("{duration_ms}ms")
+                            };
+                            let status_line = format!("{status_icon} `{tool_name}` ({duration_str})");
+
+                            // Update tool trace: remove "正在调用工具" line, add result line.
+                            let (reasoning_text, content_text) = {
+                                let reas = reasoning.lock().await;
+                                let r = reas.get(chat_id).cloned().unwrap_or_default();
+                                let acc = accumulated.lock().await;
+                                let c = acc.get(chat_id).cloned().unwrap_or_default();
+                                (r, c)
+                            };
+
+                            let trace_text = {
+                                let mut tt = tool_trace.lock().await;
+                                let entry = tt.entry(chat_id.to_string()).or_default();
+                                // Remove the "正在调用工具" line if present.
+                                if let Some(pos) = entry.rfind("\n🔧 正在调用工具:") {
+                                    entry.truncate(pos);
+                                    entry.push('\n');
+                                } else if entry.starts_with("🔧 正在调用工具:") {
+                                    entry.clear();
+                                }
+                                // Append result line.
+                                if !entry.is_empty() && !entry.ends_with('\n') {
+                                    entry.push('\n');
+                                }
+                                entry.push_str(&status_line);
+                                entry.clone()
+                            };
+
+                            let card_text = compose_streaming_card_full(&reasoning_text, &trace_text, &content_text);
+
+                            if let Err(e) = self.send_streaming_update(&draft_id, &card_text).await {
+                                warn!("Feishu streaming bridge tool_call_result update failed: {e}");
+                            }
+                        }
+                        "token" => {
+                            let delta = parsed.get("delta").and_then(|v| v.as_str()).unwrap_or("");
+                            if delta.is_empty() {
+                                continue;
+                            }
+
+                            // Accumulate content text (only actual LLM output, no tool status).
+                            let (reasoning_text, trace_text, content_text) = {
+                                let mut acc = accumulated.lock().await;
+                                let entry = acc.entry(chat_id.to_string()).or_default();
+                                entry.push_str(delta);
+                                let c = entry.clone();
+                                let reas = reasoning.lock().await;
+                                let r = reas.get(chat_id).cloned().unwrap_or_default();
+                                let tt = tool_trace.lock().await;
+                                let t = tt.get(chat_id).cloned().unwrap_or_default();
+                                (r, t, c)
+                            };
+
+                            let card_text = compose_streaming_card_full(&reasoning_text, &trace_text, &content_text);
+
+                            if let Err(e) = self.send_streaming_update(&draft_id, &card_text).await {
+                                warn!("Feishu streaming bridge update failed: {e}");
+                            }
+                        }
+                        "message_done" => {
+                            let final_text = parsed.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                            let event_reasoning = parsed.get("reasoning_content")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+
+                            info!(
+                                chat_id = chat_id,
+                                content_len = final_text.len(),
+                                event_reasoning_len = event_reasoning.len(),
+                                event_reasoning_preview = truncate_str(event_reasoning, 120),
+                                "Feishu streaming bridge received 'message_done'"
+                            );
+
+                            // Determine the final content: prefer message_done content,
+                            // fall back to accumulated content.
+                            let content_text = if !final_text.is_empty() {
+                                final_text.to_string()
+                            } else {
+                                let acc = accumulated.lock().await;
+                                acc.get(chat_id).cloned().unwrap_or_default()
+                            };
+
+                            // Build the "thinking" block. Priority:
+                            // 1. Streaming reasoning (from `thinking` events)
+                            // 2. reasoning_content from message_done event
+                            // 3. Tool execution trace (✅/❌ lines) as process summary
+                            let trace_text = {
+                                let tt = tool_trace.lock().await;
+                                tt.get(chat_id).cloned().unwrap_or_default()
+                            };
+
+                            let reasoning_text = {
+                                let reas = reasoning.lock().await;
+                                let streamed = reas.get(chat_id).cloned().unwrap_or_default();
+                                if streamed.is_empty() {
+                                    event_reasoning.to_string()
+                                } else {
+                                    streamed
+                                }
+                            };
+
+                            info!(
+                                chat_id = chat_id,
+                                final_reasoning_len = reasoning_text.len(),
+                                trace_len = trace_text.len(),
+                                content_len = content_text.len(),
+                                "Feishu streaming bridge composing final card"
+                            );
+
+                            let text = compose_streaming_card_full(&reasoning_text, &trace_text, &content_text);
+
+                            // Flush any pending throttled text before finalizing.
+                            // Use collapsible panel finalization only when:
+                            // 1. There's reasoning or tool trace content
+                            // 2. The card was created with the collapsible_panel layout
+                            let has_thinking = !reasoning_text.is_empty() || !trace_text.is_empty();
+                            let use_collapsible = has_thinking && self.card_has_collapsible(&draft_id).await;
+                            if !text.is_empty() {
+                                if use_collapsible {
+                                    if let Err(e) = self.send_streaming_finalize_collapsible(
+                                        &draft_id, &reasoning_text, &trace_text, &content_text,
+                                    ).await {
+                                        warn!("Feishu streaming bridge collapsible finalize failed: {e}");
+                                    }
+                                } else if let Err(e) = self.send_streaming_finalize(&draft_id, &text).await {
+                                    warn!("Feishu streaming bridge finalize failed: {e}");
+                                }
+                            } else if let Err(e) = self.send_streaming_cancel(&draft_id).await {
+                                warn!("Feishu streaming bridge cancel failed: {e}");
+                            }
+
+                            // Clean up all per-chat state.
+                            {
+                                let mut acc = accumulated.lock().await;
+                                acc.remove(chat_id);
+                            }
+                            {
+                                let mut reas = reasoning.lock().await;
+                                reas.remove(chat_id);
+                            }
+                            {
+                                let mut tt = tool_trace.lock().await;
+                                tt.remove(chat_id);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                _ = cleanup_interval.tick() => {
+                    // Clean up stale drafts (cards open for more than 10 minutes).
+                    let stale_threshold = std::time::Duration::from_secs(600);
+                    let stale_cards: Vec<String> = {
+                        let state = self.streaming_state.lock().await;
+                        state.cards.iter()
+                            .filter(|(_, card)| card.created_at.elapsed() > stale_threshold)
+                            .map(|(id, _)| id.clone())
+                            .collect()
+                    };
+
+                    if !stale_cards.is_empty() {
+                        warn!(count = stale_cards.len(), "Cleaning up stale streaming cards");
+                        let stale_drafts: Vec<String> = {
+                            let drafts = self.active_drafts.lock().await;
+                            drafts.iter()
+                                .filter(|(_, draft_id)| {
+                                    decode_draft_id(draft_id)
+                                        .map(|(cid, _)| stale_cards.contains(&cid.to_string()))
+                                        .unwrap_or(false)
+                                })
+                                .map(|(_, draft_id)| draft_id.clone())
+                                .collect()
+                        };
+                        for draft_id in stale_drafts {
+                            if let Err(e) = self.send_streaming_cancel(&draft_id).await {
+                                warn!("Failed to cancel stale streaming card: {e}");
+                            }
+                        }
+                    }
+                }
+                _ = shutdown.recv() => {
+                    info!("Feishu streaming bridge shutting down");
+                    break;
+                }
+            }
+        }
     }
 }
 

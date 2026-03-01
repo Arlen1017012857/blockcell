@@ -235,6 +235,13 @@ pub struct FeishuConfig {
     pub verification_token: String,
     #[serde(default)]
     pub allow_from: Vec<String>,
+    /// Enable streaming card (CardKit) for real-time LLM output display.
+    #[serde(default = "default_feishu_streaming")]
+    pub streaming: bool,
+}
+
+fn default_feishu_streaming() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]

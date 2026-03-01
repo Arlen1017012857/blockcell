@@ -57,6 +57,18 @@ impl OpenAIProvider {
         }
     }
 
+    /// Returns true if the configured model is a reasoning/thinking model
+    /// that benefits from `include_reasoning: true` (e.g. DeepSeek R1).
+    fn is_reasoning_model(&self) -> bool {
+        let m = self.model.to_lowercase();
+        m.contains("deepseek-r1")
+            || m.contains("deepseek-reasoner")
+            || m.contains("r1-")
+            || m.contains("-r1")
+            || m.contains("qwq")
+            || m.contains("thinking")
+    }
+
     /// Build a text description of tools to inject into the system prompt.
     fn build_tools_prompt(tools: &[Value]) -> String {
         let mut s = String::new();
@@ -565,6 +577,7 @@ impl OpenAIProvider {
             },
             max_tokens: self.max_tokens,
             temperature: self.temperature,
+            include_reasoning: if self.is_reasoning_model() { Some(true) } else { None },
         };
 
         let mode = if use_native_tools && !tools.is_empty() { "native" } else if !tools.is_empty() { "text" } else { "no-tools" };
@@ -617,6 +630,10 @@ struct ChatRequest {
     tool_choice: Option<String>,
     max_tokens: u32,
     temperature: f32,
+    /// OpenRouter: request reasoning tokens for thinking models (e.g. DeepSeek R1).
+    /// This is a no-op for providers that don't recognize the field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    include_reasoning: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -634,7 +651,10 @@ struct Choice {
 #[derive(Debug, Deserialize)]
 struct ResponseMessage {
     content: Option<String>,
+    /// DeepSeek native API uses "reasoning_content"
     reasoning_content: Option<String>,
+    /// OpenRouter uses "reasoning" as the normalized field name
+    reasoning: Option<String>,
     tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -682,7 +702,8 @@ impl Provider for OpenAIProvider {
                 .collect();
 
             let content = choice.message.content.unwrap_or_default();
-            let reasoning_content = choice.message.reasoning_content.clone();
+            let reasoning_content = choice.message.reasoning_content.clone()
+                .or_else(|| choice.message.reasoning.clone());
 
             // Detect if the relay stripped tool_calls:
             // - content is empty
@@ -752,7 +773,7 @@ impl Provider for OpenAIProvider {
 
         Ok(LLMResponse {
             content: if remaining_text.is_empty() { None } else { Some(remaining_text) },
-            reasoning_content: choice.message.reasoning_content,
+            reasoning_content: choice.message.reasoning_content.or(choice.message.reasoning),
             tool_calls,
             finish_reason: choice.finish_reason.unwrap_or_else(|| "stop".to_string()),
             usage: chat_response.usage.unwrap_or(Value::Null),
@@ -791,6 +812,10 @@ impl Provider for OpenAIProvider {
             "temperature": self.temperature,
             "stream": true,
         });
+
+        if self.is_reasoning_model() {
+            request["include_reasoning"] = Value::Bool(true);
+        }
 
         if !api_tools.is_empty() {
             request["tools"] = Value::Array(api_tools);
@@ -895,11 +920,29 @@ impl Provider for OpenAIProvider {
                         }
                     }
 
-                    // Reasoning content delta
-                    if let Some(r) = delta.get("reasoning_content").and_then(|v| v.as_str()) {
+                    // Reasoning content delta — check multiple field names for
+                    // compatibility across providers:
+                    //   - "reasoning_content": DeepSeek native API
+                    //   - "reasoning": OpenRouter normalized field
+                    //   - "reasoning_details": OpenRouter structured array format
+                    let reasoning_delta = delta.get("reasoning_content").and_then(|v| v.as_str())
+                        .or_else(|| delta.get("reasoning").and_then(|v| v.as_str()));
+                    if let Some(r) = reasoning_delta {
                         if !r.is_empty() {
                             reasoning_buf.push_str(r);
                             let _ = tx.send(StreamEvent::ReasoningDelta(r.to_string()));
+                        }
+                    } else if let Some(details) = delta.get("reasoning_details").and_then(|v| v.as_array()) {
+                        // OpenRouter reasoning_details: array of objects with "type" and "text"/"content"
+                        for detail in details {
+                            let text = detail.get("text").and_then(|v| v.as_str())
+                                .or_else(|| detail.get("content").and_then(|v| v.as_str()));
+                            if let Some(t) = text {
+                                if !t.is_empty() {
+                                    reasoning_buf.push_str(t);
+                                    let _ = tx.send(StreamEvent::ReasoningDelta(t.to_string()));
+                                }
+                            }
                         }
                     }
 
